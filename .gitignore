@@ -1,0 +1,26 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Personal Anki data
+*.apkg
+*.colpkg
+*.csv
+*.xlsx
+exports/
+my_anki_decks/
+
+# Config files that might contain local paths or secrets
+*.cfg
+*.ini
+.env
+config.json
