@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """CLI tool to manage a Japanese Anki vocabulary deck outside of Anki."""
 
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -11,6 +13,7 @@ import unicodedata
 import zipfile
 from collections import defaultdict
 from pathlib import Path
+from typing import IO
 
 try:
     import zstandard
@@ -25,11 +28,20 @@ EXCLUDE_FIELDS = {"Audio"}
 
 
 def _die(msg: str) -> None:
+    """Print an error message to stderr and exit with status 1."""
     print(f"Error: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
 def _decompress_anki21b(raw: bytes) -> bytes:
+    """Decompress a zstd-compressed collection.anki21b blob.
+
+    Args:
+        raw: Raw bytes of the zstd-compressed SQLite file.
+
+    Returns:
+        Decompressed SQLite database bytes.
+    """
     if not _HAVE_ZSTD:
         _die(
             "collection.anki21b is zstd-compressed. "
@@ -44,7 +56,15 @@ def _decompress_anki21b(raw: bytes) -> bytes:
 
 
 def open_apkg(apkg_path: str) -> tuple[sqlite3.Connection, tempfile.TemporaryDirectory]:
-    """Extract .apkg, decompress if needed, return (sqlite3 connection, TemporaryDirectory)."""
+    """Extract an .apkg file and return an open SQLite connection.
+
+    Args:
+        apkg_path: Path to the .apkg file.
+
+    Returns:
+        A tuple of (sqlite3 connection, TemporaryDirectory). The caller must
+        close the connection and call cleanup() on the directory when done.
+    """
     path = Path(apkg_path)
     if not path.exists():
         _die(f"File not found: {apkg_path}")
@@ -76,9 +96,12 @@ def open_apkg(apkg_path: str) -> tuple[sqlite3.Connection, tempfile.TemporaryDir
         tmp.cleanup()
         _die(f"No collection database found inside {apkg_path}")
 
+    def _unicase_collation(a: str, b: str) -> int:
+        return (a.lower() > b.lower()) - (a.lower() < b.lower())
+
     try:
         conn = sqlite3.connect(str(db_path))
-        conn.create_collation("unicase", lambda a, b: (a.lower() > b.lower()) - (a.lower() < b.lower()))
+        conn.create_collation("unicase", _unicase_collation)
         conn.execute("SELECT 1 FROM col LIMIT 1")
     except sqlite3.DatabaseError as e:
         tmp.cleanup()
@@ -88,7 +111,17 @@ def open_apkg(apkg_path: str) -> tuple[sqlite3.Connection, tempfile.TemporaryDir
 
 
 def _load_field_map(conn: sqlite3.Connection) -> dict[int, list[str]]:
-    """Return {notetype_id: [field_name, ...]} ordered by ord."""
+    """Return a mapping of notetype ID to ordered field names.
+
+    Tries the modern ``fields`` table first, then falls back to the legacy
+    JSON blob in ``col.models``.
+
+    Args:
+        conn: Open SQLite connection to an Anki collection database.
+
+    Returns:
+        Dict mapping notetype_id to a list of field names ordered by ``ord``.
+    """
     try:
         rows = conn.execute(
             "SELECT ntid, name FROM fields ORDER BY ntid, ord"
@@ -114,18 +147,42 @@ def _load_field_map(conn: sqlite3.Connection) -> dict[int, list[str]]:
 
 
 def _target_notetype(field_map: dict[int, list[str]]) -> tuple[int, list[str]]:
+    """Find the notetype that contains a 'Japanese' field.
+
+    Args:
+        field_map: Mapping returned by ``_load_field_map``.
+
+    Returns:
+        A tuple of (notetype_id, list_of_field_names).
+    """
     for ntid, names in field_map.items():
         if "Japanese" in names:
             return ntid, names
     _die("No notetype with a 'Japanese' field found in deck")
 
 
-def _open_csv(path: "str | Path") -> "csv.writer":
-    """Open a CSV writer with UTF-8-BOM encoding for Numbers compatibility."""
+def _open_csv(path: str | Path) -> IO[str]:
+    """Open a file for CSV writing with UTF-8-BOM encoding.
+
+    UTF-8-BOM ensures Numbers on macOS renders Japanese characters correctly
+    without a manual encoding selection step.
+
+    Args:
+        path: Destination file path.
+
+    Returns:
+        An open text file handle suitable for use with ``csv.writer``.
+    """
     return open(path, "w", newline="", encoding="utf-8-sig")
 
 
 def cmd_export(args: argparse.Namespace) -> None:
+    """Export all notes to a CSV file, excluding the Audio field.
+
+    Args:
+        args: Parsed CLI arguments. Must have a ``deck`` attribute with the
+            path to the .apkg file.
+    """
     conn, tmp = open_apkg(args.deck)
     try:
         field_map = _load_field_map(conn)
@@ -157,14 +214,36 @@ def cmd_export(args: argparse.Namespace) -> None:
 
 
 def _normalize(s: str) -> str:
+    """Return NFC-normalized, whitespace-stripped copy of ``s``.
+
+    Args:
+        s: Input string.
+
+    Returns:
+        Normalized string.
+    """
     return unicodedata.normalize("NFC", s).strip()
 
 
 def _first_reading_token(reading: str) -> str:
+    """Return the first whitespace-separated token from a reading string.
+
+    Args:
+        reading: The Reading field value from an Anki note.
+
+    Returns:
+        First token, or an empty string if ``reading`` is blank.
+    """
     return reading.strip().split()[0] if reading.strip() else ""
 
 
 def cmd_dupes(args: argparse.Namespace) -> None:
+    """Report duplicate notes across three tiers: exact, normalized, and reading.
+
+    Args:
+        args: Parsed CLI arguments. Must have a ``deck`` attribute with the
+            path to the .apkg file.
+    """
     conn, tmp = open_apkg(args.deck)
     try:
         field_map = _load_field_map(conn)
@@ -179,7 +258,11 @@ def cmd_dupes(args: argparse.Namespace) -> None:
                 continue
             parts = flds.split(FIELD_SEP)
             jp = parts[jp_idx] if jp_idx < len(parts) else ""
-            reading = parts[reading_idx] if reading_idx is not None and reading_idx < len(parts) else ""
+            reading = (
+                parts[reading_idx]
+                if reading_idx is not None and reading_idx < len(parts)
+                else ""
+            )
             notes.append((note_id, jp, reading))
 
         # Exact duplicates on raw Japanese field
@@ -247,6 +330,12 @@ def cmd_dupes(args: argparse.Namespace) -> None:
 
 
 def cmd_mature(args: argparse.Namespace) -> None:
+    """Export notes with mature cards (interval >= 21 days) to CSV.
+
+    Args:
+        args: Parsed CLI arguments. Must have a ``deck`` attribute with the
+            path to the .apkg file.
+    """
     conn, tmp = open_apkg(args.deck)
     try:
         field_map = _load_field_map(conn)
@@ -285,6 +374,7 @@ def cmd_mature(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    """Parse CLI arguments and dispatch to the appropriate subcommand."""
     parser = argparse.ArgumentParser(
         prog="ankitool",
         description="Manage a Japanese Anki vocabulary deck outside of Anki.",
